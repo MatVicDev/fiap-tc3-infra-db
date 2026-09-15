@@ -1,11 +1,11 @@
 output "rds_endpoint" {
-  value = aws_db_instance.oficina.address
+  value = kubernetes_service.postgres_nlb.status[0].load_balancer[0].ingress[0].hostname
 }
 
 output "rds_secret_arn" {
-  value = aws_db_instance.oficina.master_user_secret[0].secret_arn
+  value = aws_secretsmanager_secret.db_credentials.arn
 }
 
 output "db_name" {
-  value = aws_db_instance.oficina.db_name
+  value = var.db_name
 }

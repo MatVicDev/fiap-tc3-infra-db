@@ -9,15 +9,10 @@ variable "ambiente" {
   default     = "homologacao"
 }
 
-variable "db_instance_class" {
-  description = "Classe da instância RDS. db.t4g.micro cabe no free tier."
-  type        = string
-  default     = "db.t4g.micro"
-}
-
-variable "db_allocated_storage_gb" {
-  type    = number
-  default = 20
+variable "db_storage_gb" {
+  description = "Tamanho do EBS (gp3) do PersistentVolumeClaim do Postgres."
+  type        = number
+  default     = 10
 }
 
 variable "db_name" {
@@ -26,13 +21,7 @@ variable "db_name" {
 }
 
 variable "db_username" {
-  description = "Master user do RDS. A aplicação usa este mesmo usuário (ver ADR-004 sobre o trade-off de não criar um usuário de aplicação separado)."
+  description = "Master user do Postgres. A aplicação usa este mesmo usuário (ver ADR-004 sobre o trade-off de não criar um usuário de aplicação separado)."
   type        = string
   default     = "oficina_admin"
-}
-
-variable "multi_az" {
-  description = "Alta disponibilidade (2 AZs). true em produção, false em homologação para reduzir custo."
-  type        = bool
-  default     = false
 }

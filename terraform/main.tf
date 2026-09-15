@@ -1,86 +1,192 @@
-# Rede provisionada pelo repositório fiap-tc3-infra-k8s (VPC + subnets privadas do
-# EKS). Lido via SSM Parameter Store para não acoplar remote state entre repos
-# independentes — cada um tem seu próprio pipeline e ciclo de vida.
-data "aws_ssm_parameter" "vpc_id" {
-  name = "/fiap-tc3/${var.ambiente}/vpc-id"
+# Postgres roda como StatefulSet dentro do próprio cluster EKS, não via RDS:
+# este AWS Academy Learner Lab bloqueia rds:CreateDBInstance sem exceção —
+# nem RDS clássico nem uma instância dentro de um cluster Aurora passam
+# (confirmado via `aws iam simulate-principal-policy` e batendo de frente no
+# apply real). O nome deste repositório e os nomes dos parâmetros SSM
+# publicados (rds-endpoint, rds-secret-arn) continuam os mesmos para não
+# propagar a mudança para fiap-tc3-lambda-auth nem fiap-TC1-oficina.
+data "aws_ssm_parameter" "eks_cluster_name" {
+  name = "/fiap-tc3/${var.ambiente}/eks-cluster-name"
 }
 
-data "aws_ssm_parameter" "private_subnet_ids" {
-  name = "/fiap-tc3/${var.ambiente}/private-subnet-ids"
-}
-
-data "aws_ssm_parameter" "private_subnets_cidr" {
-  name = "/fiap-tc3/${var.ambiente}/private-subnets-cidr"
-}
-
-resource "aws_db_subnet_group" "oficina" {
-  name       = "fiap-tc3-oficina-${var.ambiente}"
-  subnet_ids = split(",", data.aws_ssm_parameter.private_subnet_ids.value)
-}
-
-resource "aws_security_group" "rds" {
-  name        = "fiap-tc3-rds-${var.ambiente}"
-  description = "Permite Postgres (5432) apenas a partir da rede privada do EKS/Lambda"
-  vpc_id      = data.aws_ssm_parameter.vpc_id.value
-
-  ingress {
-    description = "Postgres a partir das subnets privadas (pods EKS + Lambda de auth)"
-    from_port   = 5432
-    to_port     = 5432
-    protocol    = "tcp"
-    cidr_blocks = split(",", data.aws_ssm_parameter.private_subnets_cidr.value)
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+resource "kubernetes_namespace" "database" {
+  metadata {
+    name = "database"
   }
 }
 
-resource "aws_db_instance" "oficina" {
-  identifier     = "fiap-tc3-oficina-${var.ambiente}"
-  engine         = "postgres"
-  engine_version = "16"
-  instance_class = var.db_instance_class
+resource "random_password" "db_master" {
+  length  = 32
+  special = false
+}
 
-  allocated_storage     = var.db_allocated_storage_gb
-  max_allocated_storage = var.db_allocated_storage_gb * 3
-  storage_encrypted     = true
+resource "kubernetes_secret" "postgres_credentials" {
+  metadata {
+    name      = "postgres-credentials"
+    namespace = kubernetes_namespace.database.metadata[0].name
+  }
 
-  db_name  = var.db_name
-  username = var.db_username
-
-  # Gerenciado pela própria AWS: cria e faz rotação do secret no Secrets Manager,
-  # sem senha em variável de ambiente/state em texto puro.
-  manage_master_user_password = true
-
-  db_subnet_group_name   = aws_db_subnet_group.oficina.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-
-  multi_az                  = var.multi_az
-  backup_retention_period   = 7
-  deletion_protection       = var.ambiente == "producao"
-  skip_final_snapshot       = var.ambiente != "producao"
-  final_snapshot_identifier = var.ambiente == "producao" ? "fiap-tc3-oficina-${var.ambiente}-final" : null
-
-  tags = {
-    ambiente = var.ambiente
-    projeto  = "fiap-tc3-oficina"
+  data = {
+    POSTGRES_USER     = var.db_username
+    POSTGRES_PASSWORD = random_password.db_master.result
+    POSTGRES_DB       = var.db_name
   }
 }
 
-# Publicados para os repositórios fiap-tc3-lambda-auth e fiap-TC1-oficina lerem
-# sem precisar de acesso ao state deste repositório.
+resource "kubernetes_stateful_set" "postgres" {
+  metadata {
+    name      = "postgres"
+    namespace = kubernetes_namespace.database.metadata[0].name
+    labels    = { app = "postgres" }
+  }
+
+  spec {
+    service_name = "postgres"
+    replicas     = 1
+
+    selector {
+      match_labels = { app = "postgres" }
+    }
+
+    template {
+      metadata {
+        labels = { app = "postgres" }
+      }
+
+      spec {
+        container {
+          name  = "postgres"
+          image = "postgres:16"
+
+          port {
+            container_port = 5432
+          }
+
+          env_from {
+            secret_ref {
+              name = kubernetes_secret.postgres_credentials.metadata[0].name
+            }
+          }
+
+          env {
+            name  = "PGDATA"
+            value = "/var/lib/postgresql/data/pgdata"
+          }
+
+          volume_mount {
+            name       = "data"
+            mount_path = "/var/lib/postgresql/data"
+          }
+
+          resources {
+            requests = {
+              cpu    = "250m"
+              memory = "512Mi"
+            }
+            limits = {
+              memory = "1Gi"
+            }
+          }
+
+          readiness_probe {
+            exec {
+              command = ["pg_isready", "-U", var.db_username]
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 5
+          }
+        }
+      }
+    }
+
+    volume_claim_template {
+      metadata {
+        name = "data"
+      }
+      spec {
+        access_modes       = ["ReadWriteOnce"]
+        storage_class_name = "gp3"
+        resources {
+          requests = {
+            storage = "${var.db_storage_gb}Gi"
+          }
+        }
+      }
+    }
+  }
+}
+
+# Headless service: uso interno do cluster (pods da aplicação principal),
+# com DNS estável por pod padrão de StatefulSet.
+resource "kubernetes_service" "postgres_clusterip" {
+  metadata {
+    name      = "postgres"
+    namespace = kubernetes_namespace.database.metadata[0].name
+  }
+
+  spec {
+    selector   = { app = "postgres" }
+    cluster_ip = "None"
+
+    port {
+      port        = 5432
+      target_port = 5432
+    }
+  }
+}
+
+# NLB interno: a Lambda de autenticação (fiap-tc3-lambda-auth) roda fora do
+# cluster, numa ENI própria na mesma VPC — não alcança um ClusterIP (só
+# existe via iptables dos nós). Precisa de um endereço com presença real na
+# VPC, daí o Network Load Balancer interno gerenciado pelo AWS Load Balancer
+# Controller (já instalado em fiap-tc3-infra-k8s).
+resource "kubernetes_service" "postgres_nlb" {
+  metadata {
+    name      = "postgres-nlb"
+    namespace = kubernetes_namespace.database.metadata[0].name
+    annotations = {
+      "service.beta.kubernetes.io/aws-load-balancer-type"   = "nlb-ip"
+      "service.beta.kubernetes.io/aws-load-balancer-scheme" = "internal"
+    }
+  }
+
+  wait_for_load_balancer = true
+
+  spec {
+    type     = "LoadBalancer"
+    selector = { app = "postgres" }
+
+    port {
+      port        = 5432
+      target_port = 5432
+    }
+  }
+}
+
+resource "aws_secretsmanager_secret" "db_credentials" {
+  name = "fiap-tc3/${var.ambiente}/db-credentials"
+}
+
+resource "aws_secretsmanager_secret_version" "db_credentials" {
+  secret_id = aws_secretsmanager_secret.db_credentials.id
+  secret_string = jsonencode({
+    username = var.db_username
+    password = random_password.db_master.result
+    dbname   = var.db_name
+  })
+}
+
+# Publicados para os repositórios fiap-tc3-lambda-auth e fiap-TC1-oficina
+# lerem sem precisar de acesso ao state deste repositório — mesmo nome de
+# sempre, só o valor por trás mudou de RDS para o NLB do StatefulSet.
 resource "aws_ssm_parameter" "rds_endpoint" {
   name  = "/fiap-tc3/${var.ambiente}/rds-endpoint"
   type  = "String"
-  value = aws_db_instance.oficina.address
+  value = kubernetes_service.postgres_nlb.status[0].load_balancer[0].ingress[0].hostname
 }
 
 resource "aws_ssm_parameter" "rds_secret_arn" {
   name  = "/fiap-tc3/${var.ambiente}/rds-secret-arn"
   type  = "String"
-  value = aws_db_instance.oficina.master_user_secret[0].secret_arn
+  value = aws_secretsmanager_secret.db_credentials.arn
 }
